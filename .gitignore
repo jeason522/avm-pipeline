@@ -1,0 +1,7 @@
+build/
+*.o
+output/
+data/yolov8n.onnx
+data/yolov8n.pt
+*.tgz
+.venv/
