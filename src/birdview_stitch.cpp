@@ -57,6 +57,59 @@ static cv::Mat applyIPM(const cv::Mat& src) {
     return dst;
 }
 
+// 繪製自車示意圖（俯視車體輪廓 + 方向箭頭）
+static void drawEgoVehicle(cv::Mat& canvas, int W, int H) {
+    int cx = W + W / 2;  // 車體中心 x
+    int cy = H + H / 2;  // 車體中心 y
+
+    // 車體外框（圓角矩形效果：用橢圓 + 矩形）
+    int carW = W * 2 / 5;   // 車寬
+    int carH = H * 3 / 4;   // 車長
+    int x1 = cx - carW / 2, y1 = cy - carH / 2;
+    int x2 = cx + carW / 2, y2 = cy + carH / 2;
+
+    // 填充車體底色
+    cv::rectangle(canvas, {W, H}, {W * 2, H * 2}, {50, 50, 50}, -1);
+
+    // 車體輪廓
+    cv::rectangle(canvas, {x1, y1}, {x2, y2}, {160, 160, 160}, 2);
+
+    // 擋風玻璃（前方梯形）
+    int glassInset = carW / 6;
+    std::vector<cv::Point> windshield = {
+        {x1 + glassInset, y1 + 4},
+        {x2 - glassInset, y1 + 4},
+        {x2 - 2, y1 + carH / 5},
+        {x1 + 2, y1 + carH / 5}
+    };
+    cv::polylines(canvas, windshield, true, {120, 180, 220}, 2);
+
+    // 後擋玻璃
+    std::vector<cv::Point> rearGlass = {
+        {x1 + glassInset, y2 - 4},
+        {x2 - glassInset, y2 - 4},
+        {x2 - 2, y2 - carH / 6},
+        {x1 + 2, y2 - carH / 6}
+    };
+    cv::polylines(canvas, rearGlass, true, {120, 180, 220}, 2);
+
+    // 四個輪子
+    int wheelW = carW / 8, wheelH = carH / 8;
+    cv::rectangle(canvas, {x1 - wheelW, y1 + carH / 6}, {x1, y1 + carH / 6 + wheelH}, {140, 140, 140}, -1);
+    cv::rectangle(canvas, {x2, y1 + carH / 6}, {x2 + wheelW, y1 + carH / 6 + wheelH}, {140, 140, 140}, -1);
+    cv::rectangle(canvas, {x1 - wheelW, y2 - carH / 6 - wheelH}, {x1, y2 - carH / 6}, {140, 140, 140}, -1);
+    cv::rectangle(canvas, {x2, y2 - carH / 6 - wheelH}, {x2 + wheelW, y2 - carH / 6}, {140, 140, 140}, -1);
+
+    // 前進方向箭頭（朝上）
+    cv::arrowedLine(canvas, {cx, cy + carH / 6}, {cx, cy - carH / 4},
+                    {0, 200, 0}, 3, cv::LINE_AA, 0, 0.3);
+
+    // 方向標記文字
+    double fontScale = std::min(W, H) / 600.0;
+    cv::putText(canvas, "F", {cx - 8, y1 - 10},
+        cv::FONT_HERSHEY_SIMPLEX, fontScale, {0, 200, 0}, 2);
+}
+
 cv::Mat stitchBirdView(const std::map<std::string, cv::Mat>& views,
                        const std::string& outputDir) {
     // 檢查輸入
@@ -174,17 +227,8 @@ cv::Mat stitchBirdView(const std::map<std::string, cv::Mat>& views,
         corner.copyTo(canvas(cv::Rect(W * 2, H * 2, W, H)));
     }
 
-    // 8. 中間畫車體
-    cv::rectangle(canvas,
-        cv::Point(W, H), cv::Point(W * 2, H * 2),
-        cv::Scalar(60, 60, 60), -1);
-    cv::rectangle(canvas,
-        cv::Point(W, H), cv::Point(W * 2, H * 2),
-        cv::Scalar(120, 120, 120), 2);
-    cv::putText(canvas, "CAR",
-        cv::Point(W + W / 2 - 40, H + H / 2 + 10),
-        cv::FONT_HERSHEY_SIMPLEX, 1.5,
-        cv::Scalar(180, 180, 180), 3);
+    // 8. 中間畫自車（ego vehicle）示意圖
+    drawEgoVehicle(canvas, W, H);
 
     // 9. 儲存
     std::string outPath = outputDir + "/birdview.jpg";
@@ -197,9 +241,7 @@ cv::Mat stitchBirdView(const std::map<std::string, cv::Mat>& views,
     b_rot.copyTo(canvasNB(cv::Rect(W, H * 2, W, H)));
     l_rot.copyTo(canvasNB(cv::Rect(0, H, W, H)));
     r_rot.copyTo(canvasNB(cv::Rect(W * 2, H, W, H)));
-    cv::rectangle(canvasNB, {W, H}, {W * 2, H * 2}, {60, 60, 60}, -1);
-    cv::putText(canvasNB, "CAR", {W + W/2 - 40, H + H/2 + 10},
-        cv::FONT_HERSHEY_SIMPLEX, 1.5, {180, 180, 180}, 3);
+    drawEgoVehicle(canvasNB, W, H);
     cv::imwrite(outputDir + "/birdview_no_blend.jpg", canvasNB);
     std::cout << "[stitch] 無 blending 對比圖已儲存\n";
 
