@@ -20,6 +20,7 @@ link_directories(${ORT_DIR}/lib)
 add_executable(pipeline
     src/pipeline.cpp
     src/fisheye_calib.cpp
+    src/extrinsic_calib.cpp
     src/undistort.cpp
     src/birdview_stitch.cpp
     src/detect.cpp

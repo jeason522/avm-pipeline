@@ -32,18 +32,56 @@ static cv::Mat adjustBrightness(const cv::Mat& src, double targetMean) {
     return adjusted;
 }
 
-// IPM: 把透視圖投影到俯視圖（Inverse Perspective Mapping）
-static cv::Mat applyIPM(const cv::Mat& src) {
+// 從校正參數推導的 IPM（Inverse Perspective Mapping）
+// 使用 H = K_cam * [r0 | r1 | -R*t] 在地面平面 Z=0 上做投影
+static cv::Mat applyCalibIPM(const cv::Mat& src,
+                             const cv::Mat& K_cam,
+                             const cv::Mat& R,
+                             const cv::Mat& t_body,
+                             cv::Size outSize) {
+    // H_cam: 將地面座標 (X,Y) 投影到相機像素
+    // P_cam = R * (P_body - t) = R*P_body - R*t
+    // 因為 Z=0，只取 R 的前兩列
+    cv::Mat Rt = -R * t_body;
+
+    cv::Mat H_cam(3, 3, CV_64F);
+    cv::Mat col0 = K_cam * R.col(0);
+    cv::Mat col1 = K_cam * R.col(1);
+    cv::Mat col2 = K_cam * Rt;
+    col0.copyTo(H_cam.col(0));
+    col1.copyTo(H_cam.col(1));
+    col2.copyTo(H_cam.col(2));
+
+    // BEV 像素 → 地面座標
+    // 設定 BEV 範圍：以相機為中心，覆蓋 ±5m
+    double metersPerPixel = 10.0 / outSize.width;  // 10m 寬度
+    double cx_bev = outSize.width / 2.0;
+    double cy_bev = outSize.height / 2.0;
+
+    cv::Mat H_bev = (cv::Mat_<double>(3, 3) <<
+        metersPerPixel, 0,               -cx_bev * metersPerPixel,
+        0,              -metersPerPixel,  cy_bev * metersPerPixel,
+        0,              0,                1.0);
+
+    // H_total: BEV 像素 → 相機像素
+    cv::Mat H = H_cam * H_bev;
+
+    cv::Mat dst;
+    cv::warpPerspective(src, dst, H, outSize,
+                        cv::INTER_LINEAR | cv::WARP_INVERSE_MAP);
+    return dst;
+}
+
+// Fallback: 硬編碼梯形 IPM（無校正參數時使用）
+static cv::Mat applyFallbackIPM(const cv::Mat& src) {
     int W = src.cols, H = src.rows;
 
-    // 原圖中的梯形區域（模擬透視效果）
     std::vector<cv::Point2f> srcPts = {
         {W * 0.25f, 0},
         {W * 0.75f, 0},
         {(float)W,  (float)H},
         {0,         (float)H}
     };
-    // 目標：拉成矩形（俯視）
     std::vector<cv::Point2f> dstPts = {
         {0,       0},
         {(float)W, 0},
@@ -62,9 +100,8 @@ static void drawEgoVehicle(cv::Mat& canvas, int W, int H) {
     int cx = W + W / 2;  // 車體中心 x
     int cy = H + H / 2;  // 車體中心 y
 
-    // 車體外框（圓角矩形效果：用橢圓 + 矩形）
-    int carW = W * 2 / 5;   // 車寬
-    int carH = H * 3 / 4;   // 車長
+    int carW = W * 2 / 5;
+    int carH = H * 3 / 4;
     int x1 = cx - carW / 2, y1 = cy - carH / 2;
     int x2 = cx + carW / 2, y2 = cy + carH / 2;
 
@@ -100,18 +137,20 @@ static void drawEgoVehicle(cv::Mat& canvas, int W, int H) {
     cv::rectangle(canvas, {x1 - wheelW, y2 - carH / 6 - wheelH}, {x1, y2 - carH / 6}, {140, 140, 140}, -1);
     cv::rectangle(canvas, {x2, y2 - carH / 6 - wheelH}, {x2 + wheelW, y2 - carH / 6}, {140, 140, 140}, -1);
 
-    // 前進方向箭頭（朝上）
+    // 前進方向箭頭
     cv::arrowedLine(canvas, {cx, cy + carH / 6}, {cx, cy - carH / 4},
                     {0, 200, 0}, 3, cv::LINE_AA, 0, 0.3);
 
-    // 方向標記文字
+    // 方向標記
     double fontScale = std::min(W, H) / 600.0;
     cv::putText(canvas, "F", {cx - 8, y1 - 10},
         cv::FONT_HERSHEY_SIMPLEX, fontScale, {0, 200, 0}, 2);
 }
 
 cv::Mat stitchBirdView(const std::map<std::string, cv::Mat>& views,
-                       const std::string& outputDir) {
+                       const std::string& outputDir,
+                       const std::map<std::string, CalibResult>& calibrations,
+                       const std::map<std::string, CameraExtrinsics>& extrinsics) {
     // 檢查輸入
     if (views.find("front") == views.end() ||
         views.find("back")  == views.end() ||
@@ -124,11 +163,55 @@ cv::Mat stitchBirdView(const std::map<std::string, cv::Mat>& views,
     int W = views.at("front").cols;
     int H = views.at("front").rows;
 
+    // 判斷是否有完整的校正參數可以推導 Homography
+    bool useCalibIPM = !calibrations.empty() && !extrinsics.empty();
+    if (useCalibIPM) {
+        for (auto& cam : {"front", "back", "left", "right"}) {
+            if (calibrations.find(cam) == calibrations.end() ||
+                extrinsics.find(cam) == extrinsics.end()) {
+                useCalibIPM = false;
+                break;
+            }
+        }
+    }
+
+    if (useCalibIPM) {
+        std::cout << "[stitch] 使用校正參數推導 IPM Homography\n";
+    } else {
+        std::cout << "[stitch] 使用 fallback 梯形 IPM（無校正參數）\n";
+    }
+
     // 1. 對每張圖做 IPM
-    cv::Mat f = applyIPM(views.at("front"));
-    cv::Mat b = applyIPM(views.at("back"));
-    cv::Mat l = applyIPM(views.at("left"));
-    cv::Mat r = applyIPM(views.at("right"));
+    cv::Mat f, b, l, r;
+    cv::Size bevTile(W, H);
+
+    if (useCalibIPM) {
+        f = applyCalibIPM(views.at("front"),
+                          calibrations.at("front").K,
+                          extrinsics.at("front").R,
+                          extrinsics.at("front").t,
+                          bevTile);
+        b = applyCalibIPM(views.at("back"),
+                          calibrations.at("back").K,
+                          extrinsics.at("back").R,
+                          extrinsics.at("back").t,
+                          bevTile);
+        l = applyCalibIPM(views.at("left"),
+                          calibrations.at("left").K,
+                          extrinsics.at("left").R,
+                          extrinsics.at("left").t,
+                          bevTile);
+        r = applyCalibIPM(views.at("right"),
+                          calibrations.at("right").K,
+                          extrinsics.at("right").R,
+                          extrinsics.at("right").t,
+                          bevTile);
+    } else {
+        f = applyFallbackIPM(views.at("front"));
+        b = applyFallbackIPM(views.at("back"));
+        l = applyFallbackIPM(views.at("left"));
+        r = applyFallbackIPM(views.at("right"));
+    }
 
     // 2. 亮度補償（以 front 為基準）
     cv::Scalar frontMean = cv::mean(f);
@@ -152,7 +235,7 @@ cv::Mat stitchBirdView(const std::map<std::string, cv::Mat>& views,
     cv::Mat canvas(outH, outW, CV_8UC3, cv::Scalar(40, 40, 40));
 
     // 5. 建立 feather mask
-    int blendW = std::min(W, H) / 4;  // blending 寬度
+    int blendW = std::min(W, H) / 4;
     cv::Mat mask = createFeatherMask(W, H, blendW);
     cv::Mat mask3;
     cv::merge(std::vector<cv::Mat>{mask, mask, mask}, mask3);
@@ -165,12 +248,10 @@ cv::Mat stitchBirdView(const std::map<std::string, cv::Mat>& views,
         view.convertTo(viewF, CV_32FC3);
         region.convertTo(regionF, CV_32FC3);
 
-        // 如果目標區域是空的（深灰），直接貼
         cv::Scalar regionMean = cv::mean(region);
         if (regionMean[0] < 50 && regionMean[1] < 50 && regionMean[2] < 50) {
             view.copyTo(region);
         } else {
-            // 加權混合
             cv::Mat blended = viewF.mul(mask3) + regionF.mul(cv::Scalar(1, 1, 1) - mask3);
             blended.convertTo(region, CV_8UC3);
         }
